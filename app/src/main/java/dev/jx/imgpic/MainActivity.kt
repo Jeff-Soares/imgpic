@@ -2,9 +2,12 @@ package dev.jx.imgpic
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.RecoverableSecurityException
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.database.ContentObserver
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -16,6 +19,7 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.launch
 import androidx.core.content.ContextCompat
@@ -36,8 +40,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var externalPhotoAdapter: ExternalPhotoAdapter
 
     private val minSdk29 = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
-    private lateinit var permissionsLauncher: ActivityResultLauncher<String>
+    private lateinit var permissionsLauncher: ActivityResultLauncher<Array<String>>
+    private lateinit var deleteApprovalLauncher: ActivityResultLauncher<IntentSenderRequest>
+
     private var writePermission = false
+    private var readPermission = false
+
+    private lateinit var contentObserver: ContentObserver
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,10 +57,13 @@ class MainActivity : AppCompatActivity() {
         setupRecyclerViews()
 
         permissionsLauncher =
-            registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
-                writePermission = isGranted ?: writePermission
+            registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+                readPermission =
+                    permissions[Manifest.permission.READ_EXTERNAL_STORAGE] ?: readPermission
+                writePermission =
+                    permissions[Manifest.permission.WRITE_EXTERNAL_STORAGE] ?: writePermission
 
-                if (!isGranted) {
+                if (!writePermission) {
                     val snackbar =
                         Snackbar.make(binding.root, "Permission denied.", Snackbar.LENGTH_LONG)
                     snackbar.setAction("Settings") {
@@ -60,6 +72,16 @@ class MainActivity : AppCompatActivity() {
                         intent.data = Uri.fromParts("package", packageName, null)
                         startActivity(intent)
                     }.show()
+                }
+            }
+
+        deleteApprovalLauncher =
+            registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) {
+                if (it.resultCode == RESULT_OK) {
+                    Snackbar.make(binding.root, "Photo deleted successfully", Snackbar.LENGTH_LONG)
+                        .show()
+                } else {
+                    Snackbar.make(binding.root, "Failed to delete", Snackbar.LENGTH_LONG).show()
                 }
             }
 
@@ -88,6 +110,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         setInternalPhotosList()
+        setExternalPhotosList()
+        initContentObserver()
     }
 
     private fun setupAdapters() {
@@ -100,7 +124,11 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Delete failed", Toast.LENGTH_SHORT).show()
             }
         }
-        externalPhotoAdapter = ExternalPhotoAdapter()
+        externalPhotoAdapter = ExternalPhotoAdapter {
+            lifecycleScope.launch {
+                deletePhotoFromExternalStorage(it.contentUri)
+            }
+        }
     }
 
     private fun setupRecyclerViews() {
@@ -113,6 +141,29 @@ class MainActivity : AppCompatActivity() {
             val photos = loadPhotosFromInternalStorage()
             internalPhotoAdapter.submitList(photos)
         }
+    }
+
+    private fun setExternalPhotosList() {
+        lifecycleScope.launch {
+            val photos = loadPhotosFromExternalStorage()
+            externalPhotoAdapter.submitList(photos)
+        }
+    }
+
+    private fun initContentObserver() {
+        contentObserver = object : ContentObserver(null) {
+            override fun onChange(selfChange: Boolean) {
+                if (readPermission) {
+                    setExternalPhotosList()
+                }
+            }
+        }
+
+        contentResolver.registerContentObserver(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            true,
+            contentObserver
+        )
     }
 
     private suspend fun loadPhotosFromInternalStorage(): List<Photo> {
@@ -183,15 +234,99 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    @SuppressLint("InlinedApi")
+    private suspend fun loadPhotosFromExternalStorage(): List<SharedPhoto> {
+        return withContext(Dispatchers.IO) {
+            val collection = if (minSdk29) {
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            } else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+
+            val projection = arrayOf(
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.DISPLAY_NAME,
+                MediaStore.Images.Media.WIDTH,
+                MediaStore.Images.Media.HEIGHT
+            )
+
+            val photos = mutableListOf<SharedPhoto>()
+
+            contentResolver.query(
+                collection,
+                projection,
+                null,
+                null,
+                "${MediaStore.Images.Media.DISPLAY_NAME} ASC"
+            )?.use { cursor ->
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                val displayNameColumn =
+                    cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+                val widthColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
+                val heightColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
+
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idColumn)
+                    val displayName = cursor.getString(displayNameColumn)
+                    val width = cursor.getInt(widthColumn)
+                    val height = cursor.getInt(heightColumn)
+                    val contentUri = ContentUris.withAppendedId(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        id
+                    )
+                    photos.add(SharedPhoto(id, displayName, width, height, contentUri))
+                }
+                photos.toList()
+            } ?: listOf()
+        }
+    }
+
+    private suspend fun deletePhotoFromExternalStorage(uri: Uri) {
+        return withContext(Dispatchers.IO) {
+            try {
+                contentResolver.delete(uri, null, null)
+            } catch (e: SecurityException) {
+                val intentSender = when {
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                        MediaStore.createDeleteRequest(contentResolver, listOf(uri)).intentSender
+                    }
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
+                        val recoverableSecurityException = e as RecoverableSecurityException
+                        recoverableSecurityException.userAction.actionIntent.intentSender
+                    }
+                    else -> null
+                }
+                intentSender?.let { sender ->
+                    deleteApprovalLauncher.launch(
+                        IntentSenderRequest.Builder(sender).build()
+                    )
+                }
+            }
+        }
+    }
+
     private fun verifyPermissions() {
         writePermission = ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.WRITE_EXTERNAL_STORAGE
         ) == PackageManager.PERMISSION_GRANTED || minSdk29
 
-        if (!writePermission) {
-            permissionsLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        readPermission = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED || minSdk29
+
+        val permissionsToRequest = mutableListOf<String>()
+
+        if (readPermission) permissionsToRequest.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+        if (writePermission) permissionsToRequest.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+
+        if (permissionsToRequest.isNotEmpty()) {
+            permissionsLauncher.launch(permissionsToRequest.toTypedArray())
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        contentResolver.unregisterContentObserver(contentObserver)
     }
 
 }
